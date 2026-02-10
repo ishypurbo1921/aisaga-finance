@@ -1,0 +1,5 @@
+{
+  "name": "AISAGA Financial Report",
+  "description": "A comprehensive household financial management tool featuring automated categorization, visual analytics, and AI-powered financial health insights using Gemini.",
+  "requestFramePermissions": []
+}

@@ -1,0 +1,331 @@
+
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import { Transaction, TransactionType, Category, FinancialInsight, getFinancialCycle, getCurrentCycleLabel, getAvailableCycles, AppSettings, MONTH_NAMES } from './types';
+import TransactionForm from './components/TransactionForm';
+import DashboardCharts from './components/DashboardCharts';
+import { getFinancialAdvice } from './services/geminiService';
+import { pushToCloud, fetchFromCloud } from './services/syncService';
+
+const App: React.FC = () => {
+  const [transactions, setTransactions] = useState<Transaction[]>(() => {
+    const saved = localStorage.getItem('finas_transactions');
+    return saved ? JSON.parse(saved) : [];
+  });
+
+  const [settings, setSettings] = useState<AppSettings>(() => {
+    const saved = localStorage.getItem('finas_settings');
+    return saved ? JSON.parse(saved) : { 
+      autoIncomeAmount: 7000000, 
+      autoIncomeEnabled: true,
+      initialSavings: 0,
+      syncId: '' 
+    };
+  });
+
+  const [selectedCycle, setSelectedCycle] = useState<string>(getCurrentCycleLabel());
+  const [insight, setInsight] = useState<FinancialInsight | null>(null);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [showReportModal, setShowReportModal] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<'synced' | 'pending' | 'none'>('none');
+
+  const formatNumber = (num: number): string => num.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  const parseNumber = (str: string): number => parseInt(str.replace(/,/g, '')) || 0;
+
+  const availableCycles = useMemo(() => getAvailableCycles(transactions), [transactions]);
+
+  // Fungsi Sinkronisasi Utama
+  const syncData = useCallback(async (isInitial = false) => {
+    if (!settings.syncId) {
+      setSyncStatus('none');
+      return;
+    }
+
+    setSyncStatus('pending');
+    if (isInitial) {
+      const cloudData = await fetchFromCloud(settings.syncId);
+      if (cloudData) {
+        setTransactions(cloudData.transactions);
+        // Jangan timpa syncId saat sinkronisasi
+        setSettings(prev => ({ ...cloudData.settings, syncId: prev.syncId }));
+      }
+    } else {
+      await pushToCloud(settings.syncId, transactions, settings);
+    }
+    setSyncStatus('synced');
+  }, [settings.syncId, transactions, settings]);
+
+  // Polling data setiap 15 detik untuk real-time antar perangkat
+  useEffect(() => {
+    if (!settings.syncId) return;
+    const interval = setInterval(() => {
+      syncData(true); 
+    }, 15000); 
+    return () => clearInterval(interval);
+  }, [settings.syncId, syncData]);
+
+  // Jalankan gaji otomatis
+  useEffect(() => {
+    if (settings.autoIncomeEnabled) {
+      const todayLabel = getCurrentCycleLabel();
+      const today = new Date();
+      if (today.getFullYear() >= 2026) {
+        const hasAutoIncome = transactions.some(t => 
+          t.isAuto && t.type === TransactionType.INCOME && getFinancialCycle(t.date) === todayLabel
+        );
+
+        if (!hasAutoIncome && today.getDate() >= 25) {
+          const autoTx: Transaction = {
+            id: `auto-income-${todayLabel.replace(/\s+/g, '-')}`,
+            date: today.toISOString().split('T')[0],
+            description: `Gaji Otomatis - Siklus Baru`,
+            subCategory: 'Gaji Tetap',
+            amount: settings.autoIncomeAmount,
+            type: TransactionType.INCOME,
+            category: Category.SALARY,
+            isAuto: true
+          };
+          setTransactions(prev => [autoTx, ...prev]);
+        }
+      }
+    }
+  }, [settings.autoIncomeEnabled, settings.autoIncomeAmount, transactions]);
+
+  // Simpan lokal & trigger push cloud saat ada perubahan
+  useEffect(() => {
+    localStorage.setItem('finas_transactions', JSON.stringify(transactions));
+    localStorage.setItem('finas_settings', JSON.stringify(settings));
+    if (settings.syncId) syncData();
+  }, [transactions, settings, syncData]);
+
+  const currentCycleTransactions = useMemo(() => {
+    return transactions.filter(t => getFinancialCycle(t.date) === selectedCycle);
+  }, [transactions, selectedCycle]);
+
+  const totalIncome = currentCycleTransactions.filter(t => t.type === TransactionType.INCOME).reduce((sum, t) => sum + t.amount, 0);
+  const totalExpense = currentCycleTransactions.filter(t => t.type === TransactionType.EXPENSE).reduce((sum, t) => sum + t.amount, 0);
+  const balance = totalIncome - totalExpense;
+  const currentTotalAsset = (settings.initialSavings || 0) + transactions.filter(t => t.category === Category.TABUNGAN).reduce((sum, t) => sum + t.amount, 0);
+
+  const handleAddTransaction = (newT: Omit<Transaction, 'id'>) => {
+    const transaction: Transaction = { ...newT, id: Math.random().toString(36).substr(2, 9) };
+    setTransactions(prev => [transaction, ...prev]);
+    const newCycle = getFinancialCycle(transaction.date);
+    if (newCycle !== selectedCycle) setSelectedCycle(newCycle);
+  };
+
+  const handleDeleteTransaction = (id: string) => {
+    if (window.confirm('Hapus transaksi ini?')) {
+      setTransactions(prev => prev.filter(t => t.id !== id));
+    }
+  };
+
+  const analyzeFinances = async () => {
+    if (currentCycleTransactions.length === 0) return;
+    setIsAnalyzing(true);
+    try {
+      const advice = await getFinancialAdvice(currentCycleTransactions);
+      setInsight(advice);
+    } catch (err) {
+      console.error("Analysis failed", err);
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
+
+  const downloadExcel = () => {
+    const headers = ['Tanggal', 'Tipe', 'Kategori', 'Sub Kategori', 'Keterangan', 'Nominal (Rp)'];
+    const rows = transactions.map(t => [t.date, t.type, t.category, t.subCategory, t.description, t.amount]);
+    const csvContent = [headers.join(","), ...rows.map(e => e.join(",")), "", `TOTAL ASSET,${currentTotalAsset}`].join("\r\n");
+    const blob = new Blob([csvContent], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url; link.download = `Laporan_AISAGA.csv`; link.click();
+  };
+
+  return (
+    <div className="min-h-screen pb-20 bg-slate-50 print:bg-white text-slate-900 font-sans">
+      <nav className="bg-indigo-700 text-white sticky top-0 z-50 px-4 md:px-8 py-4 shadow-lg print:hidden">
+        <div className="max-w-7xl mx-auto flex justify-between items-center">
+          <div className="flex items-center gap-3">
+            <div className="bg-white p-2 rounded-xl">
+              <svg className="w-6 h-6 text-indigo-700" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m.599-1c.51-.51.815-1.124.815-1.801 0-1.105-1.343-2-3-2s-3 .895-3 2c0 .677.305 1.291.815 1.801M12 16h.01" /></svg>
+            </div>
+            <div>
+              <h1 className="text-xl font-black tracking-tighter italic leading-none">AISAGA</h1>
+              <div className="flex items-center gap-2">
+                <span className="text-[9px] font-bold text-indigo-200 uppercase tracking-widest">Household Sync</span>
+                {/* Indikator Sinkronisasi */}
+                <div className={`w-2 h-2 rounded-full ${syncStatus === 'synced' ? 'bg-emerald-400' : syncStatus === 'pending' ? 'bg-amber-400 animate-pulse' : 'bg-rose-400'}`}></div>
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <button onClick={() => setShowSettings(true)} className="p-2.5 bg-indigo-600 rounded-xl hover:bg-indigo-500 transition-all border border-indigo-400/30 relative">
+              <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37a1.724 1.724 0 002.572-1.065z" /></svg>
+              {syncStatus === 'none' && <span className="absolute -top-1 -right-1 w-3 h-3 bg-rose-500 rounded-full border-2 border-indigo-700"></span>}
+            </button>
+            <button onClick={analyzeFinances} disabled={isAnalyzing || currentCycleTransactions.length === 0} className="hidden md:flex items-center gap-2 px-6 py-2.5 bg-emerald-500 hover:bg-emerald-400 text-white font-black rounded-xl transition-all disabled:opacity-50">
+              {isAnalyzing ? '...' : '💡 ANALISIS AI'}
+            </button>
+          </div>
+        </div>
+      </nav>
+
+      {showSettings && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-slate-950/70 backdrop-blur-sm print:hidden">
+          <div className="bg-white rounded-[2.5rem] shadow-2xl w-full max-w-xl overflow-hidden animate-in zoom-in duration-200">
+            <div className="p-8 border-b bg-indigo-50 flex justify-between items-center">
+              <h3 className="text-xl font-black text-indigo-900">Konfigurasi & Sinkronisasi</h3>
+              <button onClick={() => setShowSettings(false)} className="p-2 text-indigo-400"><svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M6 18L18 6M6 6l12 12" /></svg></button>
+            </div>
+            <div className="p-8 space-y-6 max-h-[70vh] overflow-y-auto">
+              {/* FITUR SINKRONISASI KELUARGA */}
+              <div className="p-6 bg-indigo-50 rounded-3xl border-2 border-indigo-100 space-y-4">
+                 <div className="flex items-center gap-3">
+                    <div className="bg-indigo-600 p-2 rounded-lg text-white"><svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M8 16l2.879-2.879m0 0a3 3 0 104.243-4.242 3 3 0 00-4.243 4.242zM21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg></div>
+                    <h4 className="font-black text-indigo-900 text-xs uppercase tracking-widest">Sinkronisasi Keluarga</h4>
+                 </div>
+                 <p className="text-[10px] text-indigo-600 font-bold leading-relaxed">Masukkan kode yang sama di HP Istri agar data terhubung secara otomatis.</p>
+                 <input type="text" placeholder="Contoh: KELUARGA-JINGGA" value={settings.syncId} onChange={(e) => setSettings({...settings, syncId: e.target.value.toUpperCase()})} className="w-full px-6 py-4 bg-white border-2 border-indigo-200 rounded-xl font-black text-lg outline-none focus:border-indigo-600 placeholder:text-slate-300" />
+                 {settings.syncId && <div className="flex items-center gap-2 text-[10px] font-black text-emerald-600 uppercase tracking-widest"><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M5 13l4 4L19 7" /></svg> Sinkronisasi Aktif</div>}
+              </div>
+
+              <div className="space-y-3">
+                 <h4 className="font-black text-slate-500 text-[10px] uppercase tracking-widest">Update Gaji Bulanan</h4>
+                 <div className="flex gap-4 items-center">
+                   <input type="text" inputMode="numeric" value={formatNumber(settings.autoIncomeAmount)} onChange={(e) => setSettings({...settings, autoIncomeAmount: parseNumber(e.target.value)})} className="flex-1 px-6 py-4 bg-slate-100 border-2 border-slate-200 rounded-xl font-black text-lg outline-none focus:border-indigo-600" />
+                   <input type="checkbox" checked={settings.autoIncomeEnabled} onChange={(e) => setSettings({...settings, autoIncomeEnabled: e.target.checked})} className="w-8 h-8 accent-indigo-600" />
+                 </div>
+              </div>
+              <div className="space-y-3">
+                 <h4 className="font-black text-slate-500 text-[10px] uppercase tracking-widest">Saldo Awal Tabungan</h4>
+                 <input type="text" inputMode="numeric" value={formatNumber(settings.initialSavings)} onChange={(e) => setSettings({...settings, initialSavings: parseNumber(e.target.value)})} className="w-full px-6 py-4 bg-slate-100 border-2 border-slate-200 rounded-xl font-black text-lg outline-none focus:border-indigo-600" />
+              </div>
+              <div className="grid grid-cols-2 gap-4 pt-4">
+                <button onClick={downloadExcel} className="py-4 bg-emerald-50 text-emerald-700 font-black rounded-xl border-2 border-emerald-100 hover:bg-emerald-100 transition-colors uppercase text-xs">Simpan Excel</button>
+                <button onClick={() => { setShowSettings(false); setTimeout(() => window.print(), 300); }} className="py-4 bg-rose-50 text-rose-700 font-black rounded-xl border-2 border-rose-100 hover:bg-rose-100 transition-colors uppercase text-xs">Cetak PDF</button>
+              </div>
+            </div>
+            <div className="p-8"><button onClick={() => { syncData(); setShowSettings(false); }} className="w-full py-5 bg-indigo-700 text-white font-black rounded-xl shadow-xl shadow-indigo-100">SIMPAN & SINKRON</button></div>
+          </div>
+        </div>
+      )}
+
+      {/* Laporan Modal (Simplified for brevity as it's the same as before) */}
+      {showReportModal && (
+        <div className="fixed inset-0 z-[70] bg-white overflow-y-auto animate-in fade-in duration-300 print:static print:bg-white print:overflow-visible">
+          <div className="max-w-4xl mx-auto p-8 md:p-16">
+            <div className="flex justify-between items-center mb-12 print:hidden">
+               <button onClick={() => setShowReportModal(false)} className="flex items-center gap-2 font-black text-indigo-600 hover:underline">
+                  <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M10 19l-7-7m0 0l7-7m-7 7h18" /></svg> Kembali
+               </button>
+            </div>
+            <div className="text-center mb-16 border-b-8 border-double border-slate-900 pb-10">
+               <h1 className="text-6xl font-black italic tracking-tighter mb-2">AISAGA REPORT</h1>
+               <p className="text-slate-500 font-black uppercase tracking-[0.5em] text-xs">Laporan Keuangan Keluarga Terpadu</p>
+               <div className="mt-8 px-8 py-2 bg-slate-900 text-white inline-block rounded-full font-black text-lg uppercase tracking-widest">{selectedCycle}</div>
+            </div>
+            {/* Table and content same as original... */}
+            <div className="overflow-x-auto">
+              <table className="w-full text-left">
+                <thead>
+                  <tr className="border-b-4 border-slate-900 text-[10px] font-black uppercase tracking-widest text-slate-500">
+                    <th className="py-4 px-2">Tanggal</th>
+                    <th className="py-4 px-2">Kategori</th>
+                    <th className="py-4 px-2">Keterangan</th>
+                    <th className="py-4 px-2 text-right">Jumlah</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                   {currentCycleTransactions.map(t => (
+                      <tr key={t.id} className="text-sm font-bold">
+                        <td className="py-4 px-2 text-slate-400">{new Date(t.date).toLocaleDateString('id-ID', {day:'2-digit', month:'short'})}</td>
+                        <td className="py-4 px-2 uppercase text-[10px] font-black text-slate-500">{t.category}</td>
+                        <td className="py-4 px-2 text-slate-900">{t.description}</td>
+                        <td className={`py-4 px-2 text-right font-black ${t.type === TransactionType.INCOME ? 'text-emerald-600' : 'text-rose-600'}`}>Rp {t.amount.toLocaleString('id-ID')}</td>
+                      </tr>
+                   ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="mt-12 bg-slate-900 p-10 rounded-[2.5rem] text-white flex justify-between items-center">
+               <p className="text-xl font-black uppercase tracking-widest">Total Asset</p>
+               <p className="text-4xl font-black text-indigo-400">Rp {currentTotalAsset.toLocaleString('id-ID')}</p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <main className="max-w-7xl mx-auto px-4 md:px-8 mt-10 print:hidden">
+        {/* Periode & Insight Badge */}
+        <div className="bg-white p-8 rounded-[3rem] border-2 border-indigo-100 shadow-xl mb-12 flex flex-col md:flex-row md:items-center justify-between gap-8">
+          <div className="flex-1">
+            <span className="text-[10px] font-black text-indigo-600 uppercase tracking-[0.2em] mb-3 block">Siklus Keuangan</span>
+            <div className="relative">
+              <select value={selectedCycle} onChange={(e) => setSelectedCycle(e.target.value)} className="w-full appearance-none bg-slate-900 text-white text-2xl md:text-3xl font-black py-6 px-10 rounded-3xl cursor-pointer outline-none border-4 border-slate-900 focus:border-indigo-500 shadow-2xl pr-20 transition-all">
+                {availableCycles.map(cycle => <option key={cycle} value={cycle} className="bg-white text-slate-900">{cycle}</option>)}
+              </select>
+            </div>
+          </div>
+          <button onClick={() => setShowReportModal(true)} className="px-10 py-6 bg-indigo-950 text-white font-black rounded-3xl shadow-xl hover:scale-105 transition-all flex items-center justify-center gap-3 uppercase text-xs tracking-widest">Lihat Detail Laporan</button>
+        </div>
+
+        {/* Ringkasan Dashboard */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-8 mb-16">
+          <div className="bg-white p-10 rounded-[3rem] border-2 border-emerald-50 shadow-xl text-center">
+            <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4">Total Pemasukan</p>
+            <p className="text-4xl font-black text-emerald-600">Rp {totalIncome.toLocaleString('id-ID')}</p>
+          </div>
+          <div className="bg-white p-10 rounded-[3rem] border-2 border-rose-50 shadow-xl text-center">
+            <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4">Total Pengeluaran</p>
+            <p className="text-4xl font-black text-rose-600">Rp {totalExpense.toLocaleString('id-ID')}</p>
+          </div>
+          <div className="bg-indigo-700 p-10 rounded-[3rem] shadow-2xl text-white text-center border-4 border-indigo-600">
+            <p className="text-[10px] font-black text-indigo-200 uppercase tracking-widest mb-4">Saldo Saat Ini</p>
+            <p className="text-4xl font-black">Rp {balance.toLocaleString('id-ID')}</p>
+          </div>
+        </div>
+
+        <TransactionForm onAdd={handleAddTransaction} />
+        
+        <DashboardCharts transactions={transactions} currentCycleLabel={selectedCycle} />
+
+        {/* RIWAYAT TERKINI */}
+        <div className="bg-white rounded-[3rem] shadow-2xl border-2 border-slate-100 overflow-hidden mt-12 mb-12">
+           <div className="p-10 border-b bg-slate-50 flex justify-between items-center">
+              <h3 className="text-2xl font-black text-slate-900 italic tracking-tighter">Riwayat Terkini</h3>
+              {syncStatus === 'pending' && <span className="text-[10px] font-black text-amber-600 animate-pulse uppercase tracking-widest">Sinkronisasi Cloud...</span>}
+           </div>
+           <div className="overflow-x-auto">
+             <table className="w-full text-left">
+                <thead>
+                  <tr className="bg-slate-100 text-[10px] font-black uppercase text-slate-500 tracking-widest border-b">
+                    <th className="px-10 py-5">Tgl</th>
+                    <th className="px-10 py-5">Kategori</th>
+                    <th className="px-10 py-5">Deskripsi</th>
+                    <th className="px-10 py-5 text-right">Nominal</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-50">
+                  {currentCycleTransactions.slice(0, 10).map(t => (
+                    <tr key={t.id} className="hover:bg-indigo-50/30 transition-colors group">
+                      <td className="px-10 py-6 text-xs font-bold text-slate-400">{new Date(t.date).getDate()} {MONTH_NAMES[new Date(t.date).getMonth()]}</td>
+                      <td className="px-10 py-6 text-[10px] font-black text-slate-400 uppercase">{t.category}</td>
+                      <td className="px-10 py-6 text-sm font-bold text-slate-800">{t.description}</td>
+                      <td className={`px-10 py-6 text-right font-black text-lg ${t.type === TransactionType.INCOME ? 'text-emerald-500' : 'text-rose-500'}`}>
+                        {t.type === TransactionType.INCOME ? '+' : '-'} {t.amount.toLocaleString('id-ID')}
+                        <button onClick={() => handleDeleteTransaction(t.id)} className="ml-4 opacity-0 group-hover:opacity-100 text-rose-300 hover:text-rose-600 transition-all"><svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg></button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+             </table>
+           </div>
+        </div>
+      </main>
+    </div>
+  );
+};
+
+export default App;
