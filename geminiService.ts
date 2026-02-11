@@ -2,10 +2,9 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import { Transaction, FinancialInsight, Category } from "../types";
 
-// Inisialisasi aman: Cek apakah API_KEY tersedia
 const getAIInstance = () => {
   const apiKey = process.env.API_KEY;
-  if (!apiKey || apiKey === "undefined") {
+  if (!apiKey || apiKey === "undefined" || apiKey === "") {
     return null;
   }
   return new GoogleGenAI({ apiKey });
@@ -15,8 +14,8 @@ export const getFinancialAdvice = async (transactions: Transaction[]): Promise<F
   const ai = getAIInstance();
   if (!ai) {
     return {
-      summary: "Analisis AI tidak tersedia karena API Key belum dikonfigurasi.",
-      advice: ["Silakan masukkan API Key di pengaturan lingkungan untuk mengaktifkan fitur ini."],
+      summary: "Analisis AI tidak tersedia. Silakan konfigurasi API_KEY di Vercel Settings.",
+      advice: ["Anda tetap bisa menggunakan aplikasi untuk mencatat transaksi secara manual."],
       warnings: ["Fitur AI non-aktif."]
     };
   }
@@ -47,11 +46,15 @@ export const getFinancialAdvice = async (transactions: Transaction[]): Promise<F
       }
     });
 
-    const jsonStr = response.text?.trim() || "{}";
-    return JSON.parse(jsonStr);
+    const text = response.text;
+    return text ? JSON.parse(text) : { summary: "Gagal memproses data AI.", advice: [], warnings: [] };
   } catch (error) {
     console.error("AI Analysis Error:", error);
-    throw error;
+    return {
+      summary: "Terjadi kesalahan saat menghubungi AI.",
+      advice: ["Pastikan API Key Anda valid dan memiliki kuota."],
+      warnings: ["Error API."]
+    };
   }
 };
 
